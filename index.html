@@ -205,7 +205,7 @@ const FIREBASE_CONFIG = {
 };
 
 /* ---------- Data ("up" = toward LAST station, "down" = toward FIRST) ---------- */
-const STALE_MIN=45, STOP_SEC=10, DWELL=STOP_SEC/60, ROW=56;   // STOP_SEC = extra seconds the train waits at every station
+const STALE_MIN=45, STOP_SEC=5, ROW=56;   // STOP_SEC = extra seconds the train waits at every station
 /* Official service pattern: MMRDA timetable effective 8 Apr 2026 (Lines 2A, 7+9).
    first/last are minutes after midnight; peak/off = minutes between trains.
    PEAKS are NOT published by MMRDA: Mon–Fri 8–11 am and 5–9 pm is my assumption, edit if you know better. */
@@ -213,7 +213,7 @@ const SERVICE={
   r7:{first:350,last:1380,peak:5.83,off:9,firstTxt:'5:50 AM',lastTxt:'11:00 PM'},
   y2a:{first:350,last:1380,peak:6,off:9,firstTxt:'5:50 AM',lastTxt:'10:35–11:00 PM'}
 };
-const PEAKS=[[8,11],[17,21]];
+const PEAKS=[[8.5,11],[17,21]];
 const isPeak=d=>{const h=d.getHours()+d.getMinutes()/60,w=d.getDay();return w>=1&&w<=5&&PEAKS.some(([a,b])=>h>=a&&h<b)};
 const hwAt=(line,ts=Date.now())=>{const d=new Date(ts);return SERVICE[line][isPeak(d)?'peak':'off']};   // minutes between trains at that moment
 const LINES={
@@ -226,7 +226,9 @@ const LINES={
   mins:[2.3,2.3,2.3,2.3,2.8,2.3,2.3,2.3,2.3,2.3,2.3,2.3,2.3,2.3,2.3,2.3],   // whole line totals ~40 min with stops
   x:{0:'Line 7 · Line 9',16:'Line 1'}}
 };
-for(const k in LINES){const c=[0];LINES[k].mins.forEach(m=>c.push(c[c.length-1]+m+STOP_SEC/60));LINES[k].cum=c;}
+const dwell=()=>isPeak(new Date())?0:STOP_SEC/60;   // station wait in minutes: none at peak
+for(const k in LINES){const f=x=>{const c=[0];LINES[k].mins.forEach(m=>c.push(c[c.length-1]+m+x/60));return c},o=f(STOP_SEC),pk=f(0);
+  Object.defineProperty(LINES[k],'cum',{get(){return isPeak(new Date())?pk:o}})}   // cum switches with the time of day
 
 /* ---------- GPS (hybrid): snap phone fixes onto the line; schedule estimate is the fallback ---------- */
 /* Verified station coordinates [lat,lng] by station index (Wikipedia infoboxes). Paste more here to skip calibration.
@@ -249,15 +251,50 @@ function snap(k,lat,lng){   // nearest point on the line -> position in schedule
   }
   return best&&best.d<=GPS_TOL?best:null;
 }
-const gpsOf=u=>u.g&&u.g.ts>u.ts?u.g:null;   // a GPS fix newer than the last manual check-in
+const gpsOf=u=>u.g&&!u.w&&u.g.ts>u.ts?u.g:null;   // a GPS fix newer than the last manual check-in
+let prevFix=null,hist=[],rideN=0,quietN=0,offN=0,muteTo=0;
+const idxAt=(k,m)=>{const c=LINES[k].cum;let i=0;while(i<c.length-2&&c[i+1]<=m)i++;return m-c[i]>c[i+1]-m?i+1:i};
+function snapAny(la,ln){let b=null;for(const k in LINES){const x=snap(k,la,ln);if(x&&(!b||x.d<b.d))b={...x,k}}return b}
+function nearSt(k,la,ln){let b=null;LINES[k].stations.forEach((_,i)=>{const q=pt(k,i);if(!q)return;const d=Math.hypot((la-q[0])*KY,(ln-q[1])*KX);if(!b||d<b.d)b={i,d}});return b&&b.d<=220?b:null}
+function mkTrip(k,dir,i,w){S.line=k;S.dir=dir;S.mapLine=k;mapScrolled=false;
+  trip={line:k,dir,idx:i,from:i,dest:null,ts:Date.now()-(w?20000:1000),offset:0,mode:'at'};if(w)trip.w=1;persist();push();render()}
+const endTrip=()=>{trip=null;persist();push();render()};
 function onFix(p){
-  const {latitude:la,longitude:ln,accuracy:ac}=p.coords;lastFix={la,ln,ac,ts:Date.now()};
-  if(!trip)return;
+  const c=p.coords,now=Date.now(),la=c.latitude,ln=c.longitude,ac=c.accuracy;lastFix={la,ln,ac,ts:now};
   if(ac>GPS_ACC){gpsInfo='weak';return}
-  const sn=snap(trip.line,la,ln);
-  if(!sn){gpsInfo=known(trip.line)<2?'learn':'off';return}
-  trip.g={m:sn.m,ts:Date.now(),ac:Math.round(ac)};gpsInfo='live';   // only the position along the line is shared, never raw coordinates
-  if(Date.now()-lastPush>4000){lastPush=Date.now();persist();push()}
+  let sp=c.speed;if(sp==null&&prevFix&&now-prevFix.ts>=1000)sp=Math.hypot((la-prevFix.la)*KY,(ln-prevFix.ln)*KX)/((now-prevFix.ts)/1000);
+  prevFix={la,ln,ts:now};sp=sp==null?0:sp;
+  const sn=snapAny(la,ln);
+  if(!sn){gpsInfo=Object.keys(LINES).some(k=>known(k)>=2)?'off':'learn';rideN=quietN=0;
+    if(trip&&++offN>=10&&sp<3)endTrip();   // walked away from the route: trip over
+    return}
+  offN=0;gpsInfo='live';
+  hist.push({m:sn.m,ts:now,k:sn.k});if(hist.length>14)hist.shift();
+  const old=hist.find(h=>h.k===sn.k&&now-h.ts>=6000&&now-h.ts<=14000),dm=old?sn.m-old.m:0;
+  if(sp>=5){rideN++;quietN=0}else if(sp<2){quietN++;rideN=0}else rideN=quietN=0;
+  if(rideN>=8&&Math.abs(dm)>0.15){   // moving fast along the line = on a train, direction from motion
+    const dir=dm>0?'up':'down';
+    if(!trip||trip.w||trip.line!==sn.k){
+      const was=trip&&trip.w&&trip.line===sn.k;
+      if(was||now>muteTo){mkTrip(sn.k,dir,idxAt(sn.k,sn.m),false);
+        toast('On the train towards '+dirName(sn.k,dir),was?null:()=>{muteTo=Date.now()+300000;endTrip()})}
+    }else if(trip.dir!==dir)trip.dir=dir;
+  }
+  if(quietN>=20){   // standing still: waiting at a station, or just got off
+    const ns=nearSt(sn.k,la,ln);
+    if(ns){if(!trip||!trip.w||trip.idx!==ns.i||trip.line!==sn.k)mkTrip(sn.k,trip?trip.dir:S.dir,ns.i,true)}
+    else if(trip&&!trip.w)endTrip();
+  }
+  if(trip){trip.g={m:sn.m,ts:now,ac:Math.round(ac),sp:Math.round(sp*10)/10};   // only the position along the line is shared, never raw coordinates
+    if(now-lastPush>4000){lastPush=now;persist();push()}}
+}
+function askGps(){
+  if(S.gpsAsked)return;
+  sheet('Share your live location?',`<p class="text-sm mut mb-4">MetroSync uses GPS to place you on the line, notice when you board or wait at a station, and keep friends' positions accurate. Friends only see where you are on the line, never your coordinates. If your phone asks, choose <b>Precise</b> location.</p>
+   <button id="gOn" class="w-full py-4 rounded-2xl font-extrabold" style="background:var(--text);color:var(--ink)">Turn on GPS</button>
+   <button id="gOff" class="w-full mt-2 py-3 rounded-2xl card font-semibold">Not now</button>`);
+  $('gOn').onclick=()=>{S.gps=true;S.gpsAsked=true;persist();startGps();closeSheet();renderHero()};
+  $('gOff').onclick=()=>{S.gps=false;S.gpsAsked=true;persist();closeSheet()};
 }
 function reqWake(){try{navigator.wakeLock&&navigator.wakeLock.request('screen').then(l=>wl=l).catch(()=>{})}catch(e){}}
 function startGps(){
@@ -266,14 +303,14 @@ function startGps(){
 }
 function stopGps(){
   if(wid!=null){navigator.geolocation.clearWatch(wid);wid=null}
-  try{wl&&wl.release()}catch(e){}wl=null;lastFix=null;gpsInfo='';
+  try{wl&&wl.release()}catch(e){}wl=null;lastFix=null;gpsInfo='';prevFix=null;hist=[];rideN=quietN=offN=0;
 }
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&wid!=null)reqWake()});
 function toggleGps(){
   S.gps=!S.gps;persist();
   if(S.gps&&!navigator.geolocation)toast('This browser has no location support');
   else toast(S.gps?'GPS on. Your screen stays awake while you ride':'GPS off. Using the schedule estimate');
-  if(S.gps&&trip)startGps();else stopGps();renderHero();
+  if(S.gps)startGps();else stopGps();renderHero();
 }
 function learn(){   // called right after a station check-in: the phone is at that station, so remember where it is
   if(!trip||trip.mode!=='at'||!lastFix||Date.now()-lastFix.ts>15000||lastFix.ac>40)return;
@@ -301,7 +338,7 @@ const hue=n=>{let h=0;for(const ch of n)h=(h*31+ch.charCodeAt(0))%360;return `hs
 const ld=(k)=>{try{return JSON.parse(localStorage.getItem(k)||'null')}catch(e){return null}};
 const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
 
-let S=Object.assign({uid:null,name:'',room:'',line:'r7',dir:'up',pm:'at',gps:false,mapLine:'r7',chatRead:Date.now()},ld('metroSync')||{});
+let S=Object.assign({uid:null,name:'',room:'',line:'r7',dir:'up',pm:'at',gps:false,gpsAsked:false,mapLine:'r7',chatRead:Date.now()},ld('metroSync')||{});
 if(!S.uid){const o=ld('metroMates')||{};S.uid=o.uid||'u'+Math.random().toString(36).slice(2,10);if(!S.name){S.name=o.name||'';S.room=o.room||''}}  // migrate from old app
 let trip=ld('metroSyncTrip');
 if(trip&&Date.now()-trip.ts>STALE_MIN*60000)trip=null;
@@ -310,10 +347,10 @@ let users={},db=null,ref=null,view='ride',markers={},tickN=0,mapScrolled=false,l
 const persist=()=>{sv('metroSync',S);sv('metroSyncTrip',trip)};
 
 /* ---------- Live position estimate (dead reckoning from schedule) ---------- */
-function live(u,now=Date.now()){const r=liveCore(u,now),g=gpsOf(u);r.src=g&&now-g.ts<GPS_FRESH?'gps':'est';return r}
+function live(u,now=Date.now()){const r=liveCore(u,now),g=gpsOf(u)||(u.w?u.g:null);r.src=g&&now-g.ts<GPS_FRESH?'gps':'est';return r}
 function liveCore(u,now){
   const l=LINES[u.line],c=l.cum,n=c.length,tot=c[n-1],sg=u.dir==='up'?1:-1;
-  const g=gpsOf(u),el=(now-(g?g.ts:u.ts))/60000,dw=g||u.mode==='next'?0:DWELL;
+  const g=gpsOf(u),el=(now-(g?g.ts:u.ts))/60000,dw=u.w?1e9:g||u.mode==='next'?0:dwell();
   let m=(g?g.m:c[u.idx]-(u.mode==='next'?sg*0.6:0))+sg*Math.max(0,el-dw);
   m=Math.min(tot,Math.max(0,m));
   if(sg>0?m>=tot:m<=0){const i=sg>0?n-1:0;return{f:i,at:true,term:true,idx:i,m}}
@@ -321,7 +358,7 @@ function liveCore(u,now){
   let i=0;while(i<n-2&&c[i+1]<=m)i++;
   return{m,f:i+(m-c[i])/(c[i+1]-c[i]),prev:sg>0?i:i+1,next:sg>0?i+1:i,secs:(sg>0?c[i+1]-m:m-c[i])*60};
 }
-const liveText=(u,li)=>{const s=LINES[u.line].stations;return li.term?'Reached '+s[li.idx]:li.at?'At '+s[li.idx]:s[li.prev]+' → '+s[li.next]};
+const liveText=(u,li)=>{const s=LINES[u.line].stations;return li.term?'Reached '+s[li.idx]:li.at?(u.w?'Waiting at ':'At ')+s[li.idx]:s[li.prev]+' → '+s[li.next]};
 const eta=s=>s<15?'Arriving':`~${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
 const originTime=u=>{const g=gpsOf(u),c=LINES[u.line].cum;return g?g.ts-(u.dir==='up'?g.m:c.at(-1)-g.m)*60000:legacyOrigin(u)};
 const legacyOrigin=u=>u.ts-(u.dir==='up'?LINES[u.line].cum[u.idx]:LINES[u.line].cum.at(-1)-LINES[u.line].cum[u.idx])*60000-(u.offset||0)*hwAt(u.line,u.ts)*60000;
@@ -376,7 +413,7 @@ function renderHero(){
   const l=LINES[trip.line],li=myLive(),st=l.stations;
   const main=li.term?st[li.idx]:li.at?st[li.idx]:st[li.next];
   const lab=li.term?'You have reached':li.at?'At station':'Next station';
-  const sub=li.term?'Tap “Got off” when you leave the train':li.at?'Doors open · next stop '+(st[li.idx+(trip.dir==='up'?1:-1)]||'—'):'Just left '+st[li.prev];
+  const sub=li.term?'Tap “Got off” when you leave the train':li.at?trip.w?'Waiting at the station':'Doors open · next stop '+(st[li.idx+(trip.dir==='up'?1:-1)]||'—'):'Just left '+st[li.prev];
   const pct=li.f/(st.length-1)*100;
   h.innerHTML=`<div class="flex items-center justify-between"><span class="pill" style="color:var(--accent)">${esc(l.name)}</span><span class="pill">→ ${esc(dirName(trip.line,trip.dir))}</span></div>
    <div class="text-sm mut mt-4">${lab}</div>
@@ -456,6 +493,10 @@ function trains(rs,now){
   const out=[];
   Object.keys(LINES).forEach(k=>['up','down'].forEach(d=>{
     const a=rs.filter(r=>r.u.line===k&&r.u.dir===d).map(r=>({...r,ot:originTime(r.u)})).sort((x,y)=>x.ot-y.ot);
+    const gap=(Math.max(...LINES[k].mins)+STOP_SEC/60)*60000,mv=u=>{const q=gpsOf(u);return q&&!u.w&&now-q.ts<60000&&(q.sp==null||q.sp>2)};
+    const gp=a.filter(r=>mv(r.u));   // riders with a fresh GPS fix on a moving train
+    a.forEach(r=>{if(!r.u.w&&!mv(r.u)){const q=gp.find(x=>Math.abs(x.ot-r.ot)<=gap);if(q)r.ot=q.ot}});   // within one station = same train (real trains are 5+ min apart)
+    a.sort((x,y)=>x.ot-y.ot);
     let g=null;
     a.forEach(r=>{
       if(g&&Math.abs(r.ot-g.avg)<=0.4*hwAt(k,r.u.ts)*60000){g.m.push(r);g.avg=g.m.reduce((s,x)=>s+x.ot,0)/g.m.length}
@@ -489,7 +530,7 @@ function updateMarkers(){
   const mine=ts.find(t=>t.m.some(x=>x.id===S.uid));
   if(view==='map'&&!mapScrolled&&mine&&markers[mine.key]){mapScrolled=true;markers[mine.key].scrollIntoView({block:'center'})}
 }
-setInterval(()=>{tickN++;if(trip&&S.gps)startGps();else stopGps();if(trip){renderHero();renderEta()}updateMarkers();if(tickN%5===0)renderFriends();if(tickN%30===0)renderSvc()},1000);
+setInterval(()=>{tickN++;if(S.gps)startGps();else stopGps();if(trip){renderHero();renderEta()}updateMarkers();if(tickN%5===0)renderFriends();if(tickN%30===0)renderSvc()},1000);
 
 /* ---------- Tabs, sheets, toast ---------- */
 function show(v){view=v;$('composer').classList.toggle('on',v==='chat');['ride','map','friends','chat'].forEach(k=>$('v-'+k).classList.toggle('hidden',k!==v));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));if(v==='map')mapScrolled=false,updateMarkers();if(v==='chat'){forceScroll=true;renderChat()}else scrollTo(0,0)}
@@ -617,7 +658,7 @@ $('go').onclick=()=>{
   if(!n)return $('name').focus();if(!r)return $('room').focus();
   if(S.room&&r.toLowerCase()!==S.room.toLowerCase()&&ref){ // leaving old room
     if(fbReady&&ref.child)ref.child(S.uid).remove();trip=null}
-  S.name=n;S.room=r;persist();$('onb').classList.remove('open');connect();push();render();
+  S.name=n;S.room=r;persist();$('onb').classList.remove('open');connect();push();render();askGps();
 };
 $('roomChip').onclick=()=>{
   if(!S.room)return openOnb(false);
@@ -635,7 +676,8 @@ renderSvc();
 const inv=new URLSearchParams(location.search).get('room');
 if(inv&&!S.room){S.room=inv;if(S.name)persist()}
 persist();connect();render();renderChat();renderInstall();
-if(!S.name||!S.room)openOnb(false);else push();
+if(!S.name||!S.room)openOnb(false);else{push();askGps()}
+if(S.gps)startGps();
 </script>
 </body>
 </html>
