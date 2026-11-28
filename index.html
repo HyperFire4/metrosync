@@ -231,7 +231,10 @@ for(const k in LINES){const c=[0];LINES[k].mins.forEach(m=>c.push(c[c.length-1]+
 /* ---------- GPS (hybrid): snap phone fixes onto the line; schedule estimate is the fallback ---------- */
 /* Verified station coordinates [lat,lng] by station index (Wikipedia infoboxes). Paste more here to skip calibration.
    Stations not listed are learned from riders' check-ins made with a good GPS fix and shared in the room (rooms/<room>/geo). */
-const GEO={r7:{16:[19.11502,72.85517],15:[19.12885,72.85536]},y2a:{}};   // 16 = Gundavali, 15 = Mogra
+const GEO={r7:{   // Red Line 7, Gundavali to Dahisar East (Wikipedia station infoboxes). Kashigaon, Miragaon, Pandurangwadi (Line 9) are not filled in yet.
+  16:[19.11502,72.85517],15:[19.12885,72.85536],14:[19.14302,72.85510],13:[19.15272,72.85652],12:[19.16942,72.85873],11:[19.17976,72.85824],
+  10:[19.18726,72.85848],9:[19.19829,72.86065],8:[19.20389,72.86342],7:[19.21717,72.86670],6:[19.22425,72.86422],5:[19.23466,72.86313],
+  4:[19.24346,72.86420],3:[19.2511,72.8670]},y2a:{}};
 const GPS_TOL=600, GPS_ACC=80, GPS_FRESH=30000, KX=105200, KY=110900;   // metres per degree lng/lat near Mumbai
 let geoRoom={},gref=null,wid=null,wl=null,lastFix=null,lastPush=0,gpsInfo='';
 const pt=(k,i)=>{const g=GEO[k][i];if(g)return g;const o=geoRoom[k]&&geoRoom[k][i];return o?[o.la,o.ln]:null};
